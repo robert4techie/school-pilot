@@ -1,0 +1,1880 @@
+<?php
+require_once "auth.php";
+require_once 'conn.php';
+require_once 'tracking.php';
+
+// Check if user has permission to access this page
+$allowedRoles = ['super user', 'school leader', 'developer'];
+if (!in_array($_SESSION['role'], $allowedRoles)) {
+    header("Location: dashboard.php");
+    exit();
+}
+
+$tracker->trackAction("Parent Email Management");
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+require __DIR__ . '/vendor/autoload.php';
+
+// Prevent caching
+header("Cache-Control: no-cache, no-store, must-revalidate");
+header("Pragma: no-cache");
+header("Expires: 0");
+
+// Create parent_email_logs table if it doesn't exist
+$createTableQuery = "
+CREATE TABLE IF NOT EXISTS parent_email_logs (
+    log_id INT(11) AUTO_INCREMENT PRIMARY KEY,
+    sender_id INT(11) NOT NULL,
+    parent_id INT(11) NOT NULL,
+    student_id VARCHAR(30) NOT NULL,
+    recipient_email VARCHAR(100) NOT NULL,
+    recipient_name VARCHAR(100) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    status ENUM('sent', 'failed') NOT NULL,
+    error_message TEXT NULL,
+    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_sender (sender_id),
+    INDEX idx_parent (parent_id),
+    INDEX idx_student (student_id),
+    INDEX idx_status (status),
+    INDEX idx_sent_at (sent_at)
+)";
+$conn->query($createTableQuery);
+
+// Handle AJAX requests for fetching parents
+if (isset($_GET['action']) && $_GET['action'] === 'fetch_parents') {
+    header('Content-Type: application/json');
+
+    $class = isset($_GET['class']) ? $_GET['class'] : '';
+    $stream = isset($_GET['stream']) ? $_GET['stream'] : '';
+    $section = isset($_GET['section']) ? $_GET['section'] : '';
+    $studentStatus = isset($_GET['student_status']) ? $_GET['student_status'] : '';
+    $studentGender = isset($_GET['student_gender']) ? $_GET['student_gender'] : '';
+    $parentStatus = isset($_GET['parent_status']) ? $_GET['parent_status'] : '';
+    $search = isset($_GET['search']) ? trim($_GET['search']) : '';
+
+    $query = "SELECT 
+                p.id as parent_id,
+                p.student_id,
+                p.full_name as parent_name,
+                p.email as parent_email,
+                p.phone,
+                p.occupation,
+                p.Status as parent_status,
+                s.first_name,
+                s.last_name,
+                s.current_class,
+                s.stream,
+                s.section,
+                s.gender as student_gender,
+                s.status as student_status
+              FROM parents p
+              INNER JOIN students s ON p.student_id = s.student_id
+              WHERE 1=1";
+
+    $params = [];
+    $types = "";
+
+    if (!empty($class)) {
+        $query .= " AND s.current_class = ?";
+        $params[] = $class;
+        $types .= "s";
+    }
+
+    if (!empty($stream)) {
+        $query .= " AND s.stream = ?";
+        $params[] = $stream;
+        $types .= "s";
+    }
+
+    if (!empty($section)) {
+        $query .= " AND s.section = ?";
+        $params[] = $section;
+        $types .= "s";
+    }
+
+    if (!empty($studentStatus)) {
+        $query .= " AND s.status = ?";
+        $params[] = $studentStatus;
+        $types .= "s";
+    }
+
+    if (!empty($studentGender)) {
+        $query .= " AND s.gender = ?";
+        $params[] = $studentGender;
+        $types .= "s";
+    }
+
+    if (!empty($parentStatus)) {
+        $query .= " AND p.Status = ?";
+        $params[] = $parentStatus;
+        $types .= "s";
+    }
+
+    if (!empty($search)) {
+        $query .= " AND (p.full_name LIKE ? OR p.email LIKE ? OR s.first_name LIKE ? OR s.last_name LIKE ? OR p.student_id LIKE ?)";
+        $searchParam = "%{$search}%";
+        $params[] = $searchParam;
+        $params[] = $searchParam;
+        $params[] = $searchParam;
+        $params[] = $searchParam;
+        $params[] = $searchParam;
+        $types .= "sssss";
+    }
+
+    $query .= " ORDER BY p.full_name, s.first_name, s.last_name";
+
+    $stmt = $conn->prepare($query);
+    if (!empty($params)) {
+        $stmt->bind_param($types, ...$params);
+    }
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $parents = [];
+    while ($row = $result->fetch_assoc()) {
+        $parents[] = $row;
+    }
+
+    echo json_encode(['success' => true, 'data' => $parents]);
+    exit();
+}
+
+// Handle email sending
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['send_emails'])) {
+    header('Content-Type: application/json');
+
+    try {
+        $recipients = isset($_POST['recipients']) ? json_decode($_POST['recipients'], true) : [];
+        $subject = isset($_POST['subject']) ? trim($_POST['subject']) : '';
+        $message = isset($_POST['message']) ? trim($_POST['message']) : '';
+
+        if (empty($recipients)) {
+            echo json_encode(['success' => false, 'message' => 'No recipients selected']);
+            exit();
+        }
+
+        if (empty($subject)) {
+            echo json_encode(['success' => false, 'message' => 'Subject is required']);
+            exit();
+        }
+
+        if (empty($message)) {
+            echo json_encode(['success' => false, 'message' => 'Message is required']);
+            exit();
+        }
+
+        $conn->begin_transaction();
+
+        $successCount = 0;
+        $failCount = 0;
+        $errors = [];
+
+        foreach ($recipients as $recipient) {
+            $mail = new PHPMailer(true);
+
+            try {
+                // SMTP Configuration
+                $mail->isSMTP();
+                $mail->Host       = 'smtp.gmail.com';
+                $mail->SMTPAuth   = true;
+                $mail->Username   = 'robertsontumwesige1@gmail.com';
+                $mail->Password   = 'oenz unar mzyr uozw';
+                $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+                $mail->Port       = 587;
+
+                // Enable verbose debug output (change to 0 in production)
+                $mail->SMTPDebug  = 0;
+                $mail->Debugoutput = function ($str, $level) use (&$errors) {
+                    $errors[] = "Debug level $level: $str";
+                };
+
+                // Additional settings for better reliability
+                $mail->SMTPOptions = array(
+                    'ssl' => array(
+                        'verify_peer' => false,
+                        'verify_peer_name' => false,
+                        'allow_self_signed' => true
+                    )
+                );
+
+                // Set timeout
+                $mail->Timeout = 30;
+
+                $mail->setFrom('robertsontumwesige1@gmail.com', 'School Pilot');
+                $mail->addAddress($recipient['email'], $recipient['name']);
+
+                // Clear any previous reply-to
+                $mail->clearReplyTos();
+                $mail->addReplyTo('robertsontumwesige1@gmail.com', 'School Pilot');
+
+                $mail->isHTML(true);
+                $mail->CharSet = 'UTF-8';
+                $mail->Subject = $subject;
+                $mail->Body = "
+                    <!DOCTYPE html>
+                    <html lang='en'>
+                    <head>
+                        <meta charset='UTF-8'>
+                        <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; }
+                            .container { max-width: 600px; margin: 20px auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; border: 1px solid #dddddd; }
+                            .header { background-color: #1e8449; color: #ffffff; padding: 20px; text-align: center; }
+                            .header h1 { margin: 0; font-size: 24px; }
+                            .content { padding: 30px; line-height: 1.6; color: #333333; }
+                            .content p { margin: 0 0 15px; }
+                            .student-info { background-color: #e8f5e9; border-left: 4px solid #1e8449; padding: 15px; margin: 20px 0; border-radius: 5px; }
+                            .student-info strong { color: #1e8449; }
+                            .message-box { background-color: #f9f9f9; border-left: 4px solid #1e8449; padding: 15px; margin: 20px 0; border-radius: 5px; }
+                            .footer { background-color: #f4f4f4; color: #777777; padding: 20px; text-align: center; font-size: 12px; }
+                            .footer p { margin: 0 0 5px; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class='container'>
+                            <div class='header'>
+                                <h1>School Pilot</h1>
+                            </div>
+                            <div class='content'>
+                                <p>Hello " . htmlspecialchars($recipient['name']) . ",</p>
+                                <div class='student-info'>
+                                    <p><strong>Parent of:</strong> " . htmlspecialchars($recipient['student_name']) . "</p>
+                                    <p><strong>Student ID:</strong> " . htmlspecialchars($recipient['student_id']) . "</p>
+                                    <p><strong>Class:</strong> " . htmlspecialchars($recipient['class_stream']) . "</p>
+                                </div>
+                                <div class='message-box'>
+                                    " . nl2br(htmlspecialchars($message)) . "
+                                </div>
+                                <p>If you have any questions or concerns, please don't hesitate to contact us.</p>
+                                <p>Best regards,<br>The School Pilot Team</p>
+                            </div>
+                            <div class='footer'>
+                                <p>&copy; " . date('Y') . " School Pilot. All rights reserved.</p>
+                                <p>This email was sent using School Pilot system. This is an automated message, please do not reply.</p>
+                                <p>Visit us at https://schoolpilot.org</p>
+                                <p>For support, call: <strong>+256 747 170 325 | +256 772 548 084</strong></p>
+                            </div>
+                        </div>
+                    </body>
+                    </html>
+                ";
+
+                // Add plain text alternative
+                $mail->AltBody = "Hello " . $recipient['name'] . ", parent of " . $recipient['student_name'] . "\n\nStudent ID: " . $recipient['student_id'] . "\nClass: " . $recipient['class_stream'] . "\n\n" . strip_tags($message) . "\n\nBest regards,\nThe School Pilot Team";
+
+                // Send email
+                $sendResult = $mail->send();
+
+                if ($sendResult) {
+                    // Log success
+                    $logStmt = $conn->prepare("INSERT INTO parent_email_logs (sender_id, parent_id, student_id, recipient_email, recipient_name, subject, message, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')");
+                    $logStmt->bind_param("iisssss", $_SESSION['user_id'], $recipient['parent_id'], $recipient['student_id'], $recipient['email'], $recipient['name'], $subject, $message);
+                    $logStmt->execute();
+                    $logStmt->close();
+
+                    $successCount++;
+                } else {
+                    throw new Exception("Mail send returned false");
+                }
+            } catch (Exception $e) {
+                // Capture detailed error
+                $errorMsg = $mail->ErrorInfo;
+                $detailedError = "PHPMailer Error: " . $errorMsg;
+
+                // Add exception message if different
+                if ($e->getMessage() != $errorMsg) {
+                    $detailedError .= " | Exception: " . $e->getMessage();
+                }
+
+                // Log failure with detailed error
+                $logStmt = $conn->prepare("INSERT INTO parent_email_logs (sender_id, parent_id, student_id, recipient_email, recipient_name, subject, message, status, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?)");
+                $logStmt->bind_param("iissssss", $_SESSION['user_id'], $recipient['parent_id'], $recipient['student_id'], $recipient['email'], $recipient['name'], $subject, $message, $detailedError);
+                $logStmt->execute();
+                $logStmt->close();
+
+                $failCount++;
+                $errors[] = "Failed to send to " . $recipient['name'] . " (parent of " . $recipient['student_name'] . "): " . $detailedError;
+            }
+
+            // Clear recipients for next iteration
+            $mail->clearAddresses();
+            $mail->clearAttachments();
+        }
+
+        $conn->commit();
+
+        $responseMessage = "Successfully sent {$successCount} email(s).";
+        if ($failCount > 0) {
+            $responseMessage .= " {$failCount} failed.";
+        }
+
+        echo json_encode([
+            'success' => true,
+            'message' => $responseMessage,
+            'successCount' => $successCount,
+            'failCount' => $failCount,
+            'errors' => $errors
+        ]);
+    } catch (Exception $e) {
+        $conn->rollback();
+        echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+    }
+
+    exit();
+}
+
+// Get filter options
+$classes = $conn->query("SELECT DISTINCT current_class FROM students WHERE current_class IS NOT NULL AND current_class != '' ORDER BY current_class")->fetch_all(MYSQLI_ASSOC);
+$streams = $conn->query("SELECT DISTINCT stream FROM students WHERE stream IS NOT NULL AND stream != '' ORDER BY stream")->fetch_all(MYSQLI_ASSOC);
+$sections = $conn->query("SELECT DISTINCT section FROM students WHERE section IS NOT NULL AND section != '' ORDER BY section")->fetch_all(MYSQLI_ASSOC);
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="shortcut icon" href="images/schoolcontrol_icon.png" type="image/x-icon">
+    <title>Parent Email Management</title>
+    <style>
+        :root {
+            --primary-color: #2e7d32;
+            --primary-light: #4caf50;
+            --primary-dark: #1b5e20;
+            --secondary-color: #689f38;
+            --success-color: #4caf50;
+            --danger-color: #f44336;
+            --warning-color: #ff9800;
+            --info-color: #2196F3;
+            --text-color: #333;
+            --light-gray: #f5f5f5;
+            --medium-gray: #e0e0e0;
+            --border-radius: 8px;
+            --box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            --transition: all 0.3s ease;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            min-height: 100vh;
+            background-color: #f9fafb;
+            color: var(--text-color);
+            line-height: 1.6;
+        }
+
+        .page-container {
+            max-width: 100%;
+            margin: 0 auto;
+            margin-top: 50px;
+            padding: 20px;
+        }
+
+        .breadcrumb {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+
+        .breadcrumb a {
+            color: var(--primary-color);
+            text-decoration: none;
+            transition: var(--transition);
+        }
+
+        .breadcrumb a:hover {
+            color: var(--primary-dark);
+            text-decoration: underline;
+        }
+
+        .breadcrumb span {
+            margin: 0 8px;
+            color: #999;
+        }
+
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .page-title {
+            font-size: 28px;
+            font-weight: 600;
+            color: var(--primary-dark);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .page-title i {
+            color: var(--primary-color);
+        }
+
+        .card {
+            background: white;
+            border-radius: var(--border-radius);
+            box-shadow: var(--box-shadow);
+            overflow: hidden;
+            margin-bottom: 30px;
+            transition: var(--transition);
+        }
+
+        .card:hover {
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .card-header {
+            background: var(--primary-color);
+            color: white;
+            padding: 20px;
+            font-size: 18px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-header i {
+            margin-right: 10px;
+        }
+
+        .card-body {
+            padding: 30px;
+        }
+
+        /* Filter Section */
+        .filter-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: var(--border-radius);
+            margin-bottom: 20px;
+        }
+
+        .filter-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .filter-group label {
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 5px;
+            color: #555;
+        }
+
+        .filter-group select,
+        .filter-group input {
+            padding: 10px;
+            border: 1px solid var(--medium-gray);
+            border-radius: var(--border-radius);
+            font-size: 14px;
+            font-family: 'Poppins', sans-serif;
+            transition: var(--transition);
+        }
+
+        .filter-group select:focus,
+        .filter-group input:focus {
+            border-color: var(--primary-color);
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(46, 125, 50, 0.1);
+        }
+
+        .search-box {
+            position: relative;
+            grid-column: span 2;
+        }
+
+        .search-box input {
+            width: 100%;
+            padding-left: 40px;
+        }
+
+        .search-box i {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #999;
+        }
+
+        .filter-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        /* Parent Table */
+        .parent-table-container {
+            overflow-x: auto;
+            margin-top: 20px;
+        }
+
+        .parent-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        .parent-table thead {
+            background: var(--light-gray);
+        }
+
+        .parent-table th,
+        .parent-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--medium-gray);
+        }
+
+        .parent-table th {
+            font-weight: 600;
+            color: var(--text-color);
+            font-size: 14px;
+        }
+
+        .parent-table tbody tr {
+            transition: var(--transition);
+        }
+
+        .parent-table tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        .parent-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .parent-info-name {
+            font-weight: 500;
+            color: var(--text-color);
+        }
+
+        .parent-info-email {
+            font-size: 12px;
+            color: #666;
+        }
+
+        .student-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .student-info-name {
+            font-weight: 500;
+            color: var(--text-color);
+        }
+
+        .student-info-id {
+            font-size: 12px;
+            color: #999;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .badge-active {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .badge-inactive {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+
+        .badge-graduated {
+            background-color: #e3f2fd;
+            color: #1976d2;
+        }
+
+        .badge-transferred {
+            background-color: #fff3e0;
+            color: #f57c00;
+        }
+
+        .checkbox-cell {
+            text-align: center;
+        }
+
+        .checkbox-cell input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        /* Email Composer */
+        .email-composer {
+            background: white;
+            padding: 20px;
+            border-radius: var(--border-radius);
+            border: 1px solid var(--medium-gray);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #555;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid var(--medium-gray);
+            border-radius: var(--border-radius);
+            font-size: 14px;
+            font-family: 'Poppins', sans-serif;
+            transition: var(--transition);
+        }
+
+        .form-control:focus {
+            border-color: var(--primary-color);
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(46, 125, 50, 0.1);
+        }
+
+        textarea.form-control {
+            resize: vertical;
+            min-height: 200px;
+        }
+
+        /* Buttons */
+        .btnn {
+            font-family: "Quicksand", sans-serif !important;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: var(--border-radius);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition);
+            text-decoration: none;
+        }
+
+        .btnn-primary {
+            background-color: var(--primary-color);
+            color: white;
+        }
+
+        .btnn-primary:hover {
+            background-color: var(--primary-dark);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+
+        .btnn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+
+        .btnn-secondary:hover {
+            background-color: #5a6268;
+            transform: translateY(-2px);
+        }
+
+        .btnn-outline {
+            background-color: transparent;
+            border: 1px solid var(--medium-gray);
+            color: #555;
+        }
+
+        .btnn-outline:hover {
+            border-color: var(--primary-color);
+            color: var(--primary-color);
+            transform: translateY(-2px);
+        }
+
+        .btnn-danger {
+            background-color: var(--danger-color);
+            color: white;
+        }
+
+        .btnn-danger:hover {
+            background-color: #d32f2f;
+            transform: translateY(-2px);
+        }
+
+        .btnn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .btnn.loading {
+            position: relative;
+            color: transparent;
+            pointer-events: none;
+        }
+
+        .btnn.loading::after {
+            content: "";
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top: 2px solid white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: translate(-50%, -50%) rotate(0deg);
+            }
+
+            100% {
+                transform: translate(-50%, -50%) rotate(360deg);
+            }
+        }
+
+        /* Selection Info */
+        .selection-info {
+            background: #e3f2fd;
+            padding: 15px 20px;
+            border-radius: var(--border-radius);
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-left: 4px solid var(--info-color);
+        }
+
+        .selection-count {
+            font-weight: 600;
+            color: var(--info-color);
+        }
+
+        /* Empty State */
+        .empty-state {
+            padding: 60px 20px;
+            text-align: center;
+            color: #999;
+        }
+
+        .empty-state i {
+            font-size: 64px;
+            margin-bottom: 20px;
+            color: var(--medium-gray);
+        }
+
+        .empty-state p {
+            font-size: 18px;
+            margin-bottom: 10px;
+        }
+
+        /* Loading Overlay */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(5px);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .loading-overlay.show {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .loader {
+            width: 50px;
+            aspect-ratio: 1;
+            display: grid;
+            margin-bottom: 20px;
+        }
+
+        .loader::before,
+        .loader::after {
+            content: "";
+            grid-area: 1/1;
+            --c: no-repeat radial-gradient(farthest-side, #2e7d32 92%, #0000);
+            background: var(--c) 50% 0, var(--c) 50% 100%, var(--c) 100% 50%, var(--c) 0 50%;
+            background-size: 12px 12px;
+            animation: l12 1s infinite;
+        }
+
+        .loader::before {
+            margin: 4px;
+            filter: hue-rotate(15deg);
+            background-size: 8px 8px;
+            animation-timing-function: linear;
+        }
+
+        @keyframes l12 {
+            100% {
+                transform: rotate(.5turn);
+            }
+        }
+
+        .loading-text {
+            color: var(--primary-color);
+            font-size: 16px;
+            font-weight: 500;
+            text-align: center;
+        }
+
+        /* Notification */
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 20px;
+            border-radius: var(--border-radius);
+            color: white;
+            max-width: 400px;
+            z-index: 10000;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            display: flex;
+            align-items: flex-start;
+            animation: slideIn 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+
+        .notification i {
+            margin-right: 10px;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+
+        .notification.success {
+            background-color: rgba(76, 175, 80, 0.95);
+            border-left: 5px solid var(--primary-dark);
+        }
+
+        .notification.error {
+            background-color: rgba(244, 67, 54, 0.95);
+            border-left: 5px solid #c62828;
+        }
+
+        .notification.warning {
+            background-color: rgba(255, 152, 0, 0.95);
+            border-left: 5px solid #e65100;
+        }
+
+        .notification.info {
+            background-color: rgba(33, 150, 243, 0.95);
+            border-left: 5px solid #1565c0;
+        }
+
+        .notification-content {
+            flex: 1;
+        }
+
+        .notification-title {
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .notification-message {
+            font-size: 14px;
+            line-height: 1.4;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        @keyframes fadeOut {
+            from {
+                opacity: 1;
+            }
+
+            to {
+                opacity: 0;
+            }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .page-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .filter-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .search-box {
+                grid-column: span 1;
+            }
+
+            .parent-table {
+                font-size: 12px;
+            }
+
+            .parent-table th,
+            .parent-table td {
+                padding: 8px;
+            }
+
+            .selection-info {
+                flex-direction: column;
+                gap: 10px;
+                text-align: center;
+            }
+
+            .notification {
+                max-width: calc(100% - 40px);
+            }
+        }
+
+        .recipients-preview {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: var(--border-radius);
+            margin-bottom: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .recipients-preview h4 {
+            font-size: 14px;
+            margin-bottom: 10px;
+            color: #555;
+        }
+
+        .recipient-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: white;
+            padding: 5px 10px;
+            border-radius: 15px;
+            margin: 5px;
+            font-size: 13px;
+            border: 1px solid var(--medium-gray);
+        }
+
+        .recipient-chip i {
+            color: var(--primary-color);
+        }
+
+
+        /* Modal Styles */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(5px);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 10001;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .modal-overlay.show {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .modal-container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            max-width: 500px;
+            width: 90%;
+            transform: scale(0.9);
+            transition: transform 0.3s ease;
+        }
+
+        .modal-overlay.show .modal-container {
+            transform: scale(1);
+        }
+
+        .modal-header {
+            background: var(--primary-color);
+            color: white;
+            padding: 20px 25px;
+            border-radius: 12px 12px 0 0;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .modal-header i {
+            font-size: 24px;
+        }
+
+        .modal-header h3 {
+            margin: 0;
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        .modal-body {
+            padding: 30px 25px;
+            text-align: center;
+        }
+
+        .modal-icon {
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+        }
+
+        .modal-icon i {
+            font-size: 40px;
+            color: var(--primary-color);
+        }
+
+        .modal-message {
+            font-size: 16px;
+            color: var(--text-color);
+            margin-bottom: 10px;
+            line-height: 1.6;
+        }
+
+        .modal-message strong {
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+
+        .modal-submessage {
+            font-size: 14px;
+            color: #666;
+            margin: 0;
+        }
+
+        .modal-footer {
+            padding: 20px 25px;
+            background: #f8f9fa;
+            border-radius: 0 0 12px 12px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        .modal-footer .btnn {
+            min-width: 120px;
+        }
+
+        @media (max-width: 768px) {
+            .modal-container {
+                max-width: 95%;
+            }
+
+            .modal-footer {
+                flex-direction: column-reverse;
+            }
+
+            .modal-footer .btnn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loader"></div>
+        <div class="loading-text">Loading parent data...</div>
+    </div>
+
+    <?php require_once 'nav.php' ?>
+
+    <div class="page-container">
+        <div class="breadcrumb">
+            <a href="dashboard.php">Dashboard</a>
+            <span>/</span>
+            <span>Communication</span>
+            <span>/</span>
+            <span>Parent Email Management</span>
+        </div>
+
+        <!-- Filter Section -->
+        <div class="card">
+            <div class="card-header">
+                <div><i class="fas fa-filter"></i> Filter Parents</div>
+            </div>
+            <div class="card-body">
+                <!-- Replace the Filter Section in parent_email.php with this -->
+
+                <div class="filter-section">
+                    <div class="filter-grid">
+                        <div class="filter-group">
+                            <label for="filterClass">Student Class</label>
+                            <select id="filterClass">
+                                <option value="">All Classes</option>
+                                <?php foreach ($classes as $class): ?>
+                                    <option value="<?php echo htmlspecialchars($class['current_class']); ?>">
+                                        <?php echo htmlspecialchars($class['current_class']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="filterStream">Student Stream</label>
+                            <select id="filterStream">
+                                <option value="">All Streams</option>
+                                <?php foreach ($streams as $stream): ?>
+                                    <option value="<?php echo htmlspecialchars($stream['stream']); ?>">
+                                        <?php echo htmlspecialchars($stream['stream']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="filterSection">Student Section</label>
+                            <select id="filterSection">
+                                <option value="">All Sections</option>
+                                <?php foreach ($sections as $section): ?>
+                                    <option value="<?php echo htmlspecialchars($section['section']); ?>">
+                                        <?php echo htmlspecialchars($section['section']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="filterStudentStatus">Student Status</label>
+                            <select id="filterStudentStatus">
+                                <option value="">All Statuses</option>
+                                <option value="active">Active</option>
+                                <option value="inactive">Inactive</option>
+                                <option value="graduated">Graduated</option>
+                                <option value="transferred">Transferred</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="filterStudentGender">Student Gender</label>
+                            <select id="filterStudentGender">
+                                <option value="">All Genders</option>
+                                <option value="Male">Male</option>
+                                <option value="Female">Female</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group">
+                            <label for="filterParentStatus">Parent Status</label>
+                            <select id="filterParentStatus">
+                                <option value="">All Statuses</option>
+                                <option value="active">Active</option>
+                                <option value="inactive">Inactive</option>
+                            </select>
+                        </div>
+
+                        <div class="filter-group search-box">
+                            <label for="searchInput">Search</label>
+                            <input type="text" id="searchInput" placeholder="Search by parent name, student name, email, or ID...">
+                        </div>
+                    </div>
+
+                    <div class="filter-actions">
+                        <button type="button" class="btnn btnn-outline" id="clearFilters">
+                            <i class="fas fa-times"></i> Clear All Filters
+                        </button>
+                    </div>
+                </div>
+                <div id="selectionInfo" class="selection-info" style="display: none;">
+                    <div>
+                        <span class="selection-count" id="selectedCount">0</span> parent(s) selected
+                    </div>
+                    <div>
+                        <button type="button" class="btnn btnn-secondary" id="deselectAll">
+                            <i class="fas fa-times-circle"></i> Deselect All
+                        </button>
+                    </div>
+                </div>
+
+                <div class="parent-table-container">
+                    <table class="parent-table">
+                        <thead>
+                            <tr>
+                                <th class="checkbox-cell">
+                                    <input type="checkbox" id="selectAll" title="Select All">
+                                </th>
+                                <th>Parent Name</th>
+                                <th>Email</th>
+                                <th>Student Name</th>
+                                <th>Student ID</th>
+                                <th>Class (Stream)</th>
+                                <th>Student Status</th>
+                                <th>Parent Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="parentTableBody">
+                            <tr>
+                                <td colspan="8" class="empty-state">
+                                    <i class="fas fa-spinner fa-spin"></i>
+                                    <p>Loading parents...</p>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Email Composer Section -->
+        <div class="card">
+            <div class="card-header">
+                <div><i class="fas fa-paper-plane"></i> Compose Email to Parents</div>
+            </div>
+            <div class="card-body">
+                <div id="recipientsPreview" class="recipients-preview" style="display: none;">
+                    <h4><i class="fas fa-users"></i> Selected Recipients:</h4>
+                    <div id="recipientsList"></div>
+                </div>
+
+                <form id="emailForm">
+                    <div class="form-group">
+                        <label for="emailSubject">Subject <span style="color: red;">*</span></label>
+                        <input type="text" id="emailSubject" class="form-control" placeholder="Enter email subject..." required>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="emailMessage">Message <span style="color: red;">*</span></label>
+                        <textarea id="emailMessage" class="form-control" placeholder="Type your message here..." required></textarea>
+                    </div>
+
+                    <div style="display: flex; justify-content: flex-end; gap: 15px;">
+                        <button type="button" class="btnn btnn-outline" id="clearForm">
+                            <i class="fas fa-eraser"></i> Clear
+                        </button>
+                        <button type="submit" class="btnn btnn-primary" id="sendEmailBtn">
+                            <i class="fas fa-paper-plane"></i> Send Email
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add this HTML right before the closing </body> tag in parent_email.php (after the audio tags) -->
+
+    <!-- Custom Confirmation Modal -->
+    <div class="modal-overlay" id="confirmModal">
+        <div class="modal-container">
+            <div class="modal-header">
+                <i class="fas fa-paper-plane"></i>
+                <h3>Confirm Email Send</h3>
+            </div>
+            <div class="modal-body">
+                <div class="modal-icon">
+                    <i class="fas fa-envelope-open-text"></i>
+                </div>
+                <p class="modal-message">You are about to send email to <strong id="recipientCount">0</strong> parent(s).</p>
+                <p class="modal-submessage">This action cannot be undone. Do you want to continue?</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btnn btnn-outline" id="cancelSend">
+                    <i class="fas fa-times"></i> Cancel
+                </button>
+                <button type="button" class="btnn btnn-primary" id="confirmSend">
+                    <i class="fas fa-check"></i> Yes, Send Email
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <audio id="successSound" preload="auto">
+        <source src="sounds/success.mp3" type="audio/mpeg">
+    </audio>
+    <audio id="errorSound" preload="auto">
+        <source src="sounds/error.wav" type="audio/mpeg">
+    </audio>
+
+    <script>
+        // COMPLETE JAVASCRIPT SECTION - Replace entire <script> section in parent_email.php
+
+        let parentData = [];
+        let filteredParentData = [];
+        let selectedParents = new Map();
+
+        // Show/Hide Loading Overlay
+        function showLoader(message = 'Processing...') {
+            const overlay = document.getElementById('loadingOverlay');
+            const loadingText = overlay.querySelector('.loading-text');
+            loadingText.textContent = message;
+            overlay.classList.add('show');
+        }
+
+        function hideLoader() {
+            document.getElementById('loadingOverlay').classList.remove('show');
+        }
+
+        // Notification System
+        function showNotification(title, message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+
+            let icon = 'fa-info-circle';
+            if (type === 'success') icon = 'fa-check-circle';
+            if (type === 'error') icon = 'fa-exclamation-circle';
+            if (type === 'warning') icon = 'fa-exclamation-triangle';
+
+            notification.innerHTML = `
+        <i class="fas ${icon}"></i>
+        <div class="notification-content">
+            <div class="notification-title">${title}</div>
+            <div class="notification-message">${message}</div>
+        </div>
+    `;
+
+            document.body.appendChild(notification);
+
+            if (type === 'success') playSuccessSound();
+            if (type === 'error') playErrorSound();
+
+            setTimeout(() => {
+                notification.style.animation = 'fadeOut 0.3s ease';
+                setTimeout(() => notification.remove(), 300);
+            }, 5000);
+        }
+
+        function playSuccessSound() {
+            const sound = document.getElementById('successSound');
+            if (sound) {
+                sound.currentTime = 0;
+                sound.play().catch(e => console.log('Audio play failed:', e));
+            }
+        }
+
+        function playErrorSound() {
+            const sound = document.getElementById('errorSound');
+            if (sound) {
+                sound.currentTime = 0;
+                sound.play().catch(e => console.log('Audio play failed:', e));
+            }
+        }
+
+        // Fetch ALL Parents Data on page load
+        async function fetchAllParents() {
+            const params = new URLSearchParams({
+                action: 'fetch_parents'
+            });
+
+            try {
+                showLoader('Loading all parent data...');
+                const response = await fetch(`parent_email.php?${params}`);
+                const result = await response.json();
+
+                if (result.success) {
+                    parentData = result.data;
+                    filteredParentData = [...parentData]; // Initialize filtered data with all parents
+                    renderParentTable();
+                    showNotification('Success', `Loaded ${parentData.length} parent(s)`, 'success');
+                } else {
+                    showNotification('Error', 'Failed to load parent data', 'error');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showNotification('Error', 'An error occurred while loading parent data', 'error');
+            } finally {
+                hideLoader();
+            }
+        }
+
+        // Filter parent data based on current filter values
+        function applyFilters() {
+            const classFilter = document.getElementById('filterClass').value;
+            const stream = document.getElementById('filterStream').value;
+            const section = document.getElementById('filterSection').value;
+            const studentStatus = document.getElementById('filterStudentStatus').value;
+            const studentGender = document.getElementById('filterStudentGender').value;
+            const parentStatus = document.getElementById('filterParentStatus').value;
+            const search = document.getElementById('searchInput').value.toLowerCase().trim();
+
+            filteredParentData = parentData.filter(parent => {
+                // Class filter
+                if (classFilter && parent.current_class !== classFilter) {
+                    return false;
+                }
+
+                // Stream filter
+                if (stream && parent.stream !== stream) {
+                    return false;
+                }
+
+                // Section filter
+                if (section && parent.section !== section) {
+                    return false;
+                }
+
+                // Student Status filter
+                if (studentStatus && parent.student_status !== studentStatus) {
+                    return false;
+                }
+
+                // Student Gender filter
+                if (studentGender && parent.student_gender !== studentGender) {
+                    return false;
+                }
+
+                // Parent Status filter
+                if (parentStatus && parent.parent_status !== parentStatus) {
+                    return false;
+                }
+
+                // Search filter (searches in parent name, email, student name, and student ID)
+                if (search) {
+                    const parentName = parent.parent_name.toLowerCase();
+                    const parentEmail = (parent.parent_email || '').toLowerCase();
+                    const studentName = `${parent.first_name} ${parent.last_name}`.toLowerCase();
+                    const studentId = parent.student_id.toLowerCase();
+
+                    if (!parentName.includes(search) &&
+                        !parentEmail.includes(search) &&
+                        !studentName.includes(search) &&
+                        !studentId.includes(search)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            });
+
+            renderParentTable();
+        }
+
+        function renderParentTable() {
+            const tbody = document.getElementById('parentTableBody');
+
+            if (filteredParentData.length === 0) {
+                tbody.innerHTML = `
+             <tr>
+                <td colspan="8" class="empty-state" style="text-align: center;">
+                    <i class="fas fa-users-slash"></i>
+                    <p>No parents found matching your filters</p>
+                </td>
+            </tr>
+        `;
+                return;
+            }
+
+            tbody.innerHTML = filteredParentData.map(parent => {
+                const isSelected = selectedParents.has(parent.parent_id);
+                const classStream = `${parent.current_class} (${parent.stream})`;
+                const studentName = `${parent.first_name} ${parent.last_name}`;
+
+                let statusBadgeClass = 'badge-active';
+                if (parent.student_status === 'inactive') statusBadgeClass = 'badge-inactive';
+                if (parent.student_status === 'graduated') statusBadgeClass = 'badge-graduated';
+                if (parent.student_status === 'transferred') statusBadgeClass = 'badge-transferred';
+
+                return `
+            <tr>
+                <td class="checkbox-cell">
+                    <input type="checkbox" 
+                           class="parent-checkbox" 
+                           data-parent-id="${parent.parent_id}"
+                           data-parent-name="${parent.parent_name}"
+                           data-parent-email="${parent.parent_email}"
+                           data-student-id="${parent.student_id}"
+                           data-student-name="${studentName}"
+                           data-class-stream="${classStream}"
+                           ${isSelected ? 'checked' : ''}>
+                </td>
+                <td>
+                    <div class="parent-info">
+                        <span class="parent-info-name">${parent.parent_name}</span>
+                    </div>
+                </td>
+                <td>
+                    <div class="parent-info">
+                        <span class="parent-info-email">${parent.parent_email || 'N/A'}</span>
+                    </div>
+                </td>
+                <td>
+                    <div class="student-info">
+                        <span class="student-info-name">${studentName}</span>
+                    </div>
+                </td>
+                <td>
+                    <div class="student-info">
+                        <span class="student-info-id">${parent.student_id}</span>
+                    </div>
+                </td>
+                <td>${classStream}</td>
+                <td>
+                    <span class="badge ${statusBadgeClass}">
+                        ${parent.student_status.charAt(0).toUpperCase() + parent.student_status.slice(1)}
+                    </span>
+                </td>
+                <td>
+                    <span class="badge ${parent.parent_status.toLowerCase() === 'active' ? 'badge-active' : 'badge-inactive'}">
+                        ${parent.parent_status}
+                    </span>
+                </td>
+            </tr>
+        `;
+            }).join('');
+
+            attachCheckboxListeners();
+            updateSelectionInfo();
+        }
+
+        // Attach Checkbox Listeners
+        function attachCheckboxListeners() {
+            const checkboxes = document.querySelectorAll('.parent-checkbox');
+            checkboxes.forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    const parentId = this.dataset.parentId;
+                    const parentName = this.dataset.parentName;
+                    const parentEmail = this.dataset.parentEmail;
+                    const studentId = this.dataset.studentId;
+                    const studentName = this.dataset.studentName;
+                    const classStream = this.dataset.classStream;
+
+                    if (this.checked) {
+                        selectedParents.set(parentId, {
+                            parent_id: parentId,
+                            name: parentName,
+                            email: parentEmail,
+                            student_id: studentId,
+                            student_name: studentName,
+                            class_stream: classStream
+                        });
+                    } else {
+                        selectedParents.delete(parentId);
+                    }
+
+                    updateSelectionInfo();
+                    updateSelectAllCheckbox();
+                });
+            });
+        }
+
+        // Select All Functionality
+        document.getElementById('selectAll').addEventListener('change', function() {
+            const checkboxes = document.querySelectorAll('.parent-checkbox');
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = this.checked;
+                const parentId = checkbox.dataset.parentId;
+                const parentName = checkbox.dataset.parentName;
+                const parentEmail = checkbox.dataset.parentEmail;
+                const studentId = checkbox.dataset.studentId;
+                const studentName = checkbox.dataset.studentName;
+                const classStream = checkbox.dataset.classStream;
+
+                if (this.checked) {
+                    selectedParents.set(parentId, {
+                        parent_id: parentId,
+                        name: parentName,
+                        email: parentEmail,
+                        student_id: studentId,
+                        student_name: studentName,
+                        class_stream: classStream
+                    });
+                } else {
+                    selectedParents.delete(parentId);
+                }
+            });
+
+            updateSelectionInfo();
+        });
+
+        // Update Select All Checkbox
+        function updateSelectAllCheckbox() {
+            const selectAllCheckbox = document.getElementById('selectAll');
+            const checkboxes = document.querySelectorAll('.parent-checkbox');
+            const checkedCount = document.querySelectorAll('.parent-checkbox:checked').length;
+
+            if (checkboxes.length === 0) {
+                selectAllCheckbox.checked = false;
+                selectAllCheckbox.indeterminate = false;
+            } else if (checkedCount === checkboxes.length) {
+                selectAllCheckbox.checked = true;
+                selectAllCheckbox.indeterminate = false;
+            } else if (checkedCount > 0) {
+                selectAllCheckbox.checked = false;
+                selectAllCheckbox.indeterminate = true;
+            } else {
+                selectAllCheckbox.checked = false;
+                selectAllCheckbox.indeterminate = false;
+            }
+        }
+
+        // Update Selection Info
+        function updateSelectionInfo() {
+            const selectionInfo = document.getElementById('selectionInfo');
+            const selectedCount = document.getElementById('selectedCount');
+            const recipientsPreview = document.getElementById('recipientsPreview');
+            const recipientsList = document.getElementById('recipientsList');
+
+            selectedCount.textContent = selectedParents.size;
+
+            if (selectedParents.size > 0) {
+                selectionInfo.style.display = 'flex';
+                recipientsPreview.style.display = 'block';
+
+                recipientsList.innerHTML = Array.from(selectedParents.values())
+                    .map(parent => `
+                <span class="recipient-chip">
+                    <i class="fas fa-user"></i>
+                    ${parent.name} (Parent of ${parent.student_name})
+                </span>
+            `).join('');
+            } else {
+                selectionInfo.style.display = 'none';
+                recipientsPreview.style.display = 'none';
+            }
+        }
+
+        // Deselect All
+        document.getElementById('deselectAll').addEventListener('click', function() {
+            selectedParents.clear();
+            const checkboxes = document.querySelectorAll('.parent-checkbox');
+            checkboxes.forEach(checkbox => checkbox.checked = false);
+            document.getElementById('selectAll').checked = false;
+            document.getElementById('selectAll').indeterminate = false;
+            updateSelectionInfo();
+        });
+
+        // Add event listeners for dynamic filtering
+        document.getElementById('filterClass').addEventListener('change', applyFilters);
+        document.getElementById('filterStream').addEventListener('change', applyFilters);
+        document.getElementById('filterSection').addEventListener('change', applyFilters);
+        document.getElementById('filterStudentStatus').addEventListener('change', applyFilters);
+        document.getElementById('filterStudentGender').addEventListener('change', applyFilters);
+        document.getElementById('filterParentStatus').addEventListener('change', applyFilters);
+
+        // Live search as user types
+        let searchTimeout;
+        document.getElementById('searchInput').addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {
+                applyFilters();
+            }, 300); // Debounce search by 300ms for better performance
+        });
+
+        // Clear Filters
+        document.getElementById('clearFilters').addEventListener('click', function() {
+            document.getElementById('filterClass').value = '';
+            document.getElementById('filterStream').value = '';
+            document.getElementById('filterSection').value = '';
+            document.getElementById('filterStudentStatus').value = '';
+            document.getElementById('filterStudentGender').value = '';
+            document.getElementById('filterParentStatus').value = '';
+            document.getElementById('searchInput').value = '';
+
+            // Reset to show all parents
+            filteredParentData = [...parentData];
+            renderParentTable();
+        });
+
+        // Clear Form
+        document.getElementById('clearForm').addEventListener('click', function() {
+            document.getElementById('emailSubject').value = '';
+            document.getElementById('emailMessage').value = '';
+        });
+
+        // Custom Confirm Modal Functions
+        function showConfirmModal(recipientCount) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('confirmModal');
+                const recipientCountEl = document.getElementById('recipientCount');
+                const confirmBtn = document.getElementById('confirmSend');
+                const cancelBtn = document.getElementById('cancelSend');
+
+                recipientCountEl.textContent = recipientCount;
+                modal.classList.add('show');
+
+                // Handle confirm
+                const handleConfirm = () => {
+                    modal.classList.remove('show');
+                    cleanup();
+                    resolve(true);
+                };
+
+                // Handle cancel
+                const handleCancel = () => {
+                    modal.classList.remove('show');
+                    cleanup();
+                    resolve(false);
+                };
+
+                // Handle escape key
+                const handleEscape = (e) => {
+                    if (e.key === 'Escape') {
+                        handleCancel();
+                    }
+                };
+
+                // Cleanup function
+                const cleanup = () => {
+                    confirmBtn.removeEventListener('click', handleConfirm);
+                    cancelBtn.removeEventListener('click', handleCancel);
+                    modal.removeEventListener('click', handleOverlayClick);
+                    document.removeEventListener('keydown', handleEscape);
+                };
+
+                // Handle clicking outside modal
+                const handleOverlayClick = (e) => {
+                    if (e.target === modal) {
+                        handleCancel();
+                    }
+                };
+
+                // Attach event listeners
+                confirmBtn.addEventListener('click', handleConfirm);
+                cancelBtn.addEventListener('click', handleCancel);
+                modal.addEventListener('click', handleOverlayClick);
+                document.addEventListener('keydown', handleEscape);
+            });
+        }
+
+        // Send Email
+        document.getElementById('emailForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            if (selectedParents.size === 0) {
+                showNotification('No Recipients', 'Please select at least one parent to send email', 'warning');
+                return;
+            }
+
+            const subject = document.getElementById('emailSubject').value.trim();
+            const message = document.getElementById('emailMessage').value.trim();
+
+            if (!subject) {
+                showNotification('Validation Error', 'Subject is required', 'error');
+                return;
+            }
+
+            if (!message) {
+                showNotification('Validation Error', 'Message is required', 'error');
+                return;
+            }
+
+            const recipients = Array.from(selectedParents.values());
+
+            // Show custom confirmation modal instead of browser alert
+            const confirmed = await showConfirmModal(recipients.length);
+            if (!confirmed) return;
+
+            const sendBtn = document.getElementById('sendEmailBtn');
+            sendBtn.classList.add('loading');
+            sendBtn.disabled = true;
+
+            try {
+                showLoader(`Sending emails to ${recipients.length} recipient(s)...`);
+
+                const formData = new FormData();
+                formData.append('send_emails', '1');
+                formData.append('recipients', JSON.stringify(recipients));
+                formData.append('subject', subject);
+                formData.append('message', message);
+
+                const response = await fetch('parent_email.php', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showNotification('Success', result.message, 'success');
+
+                    // Clear form and selections
+                    document.getElementById('emailSubject').value = '';
+                    document.getElementById('emailMessage').value = '';
+                    selectedParents.clear();
+                    const checkboxes = document.querySelectorAll('.parent-checkbox');
+                    checkboxes.forEach(checkbox => checkbox.checked = false);
+                    document.getElementById('selectAll').checked = false;
+                    updateSelectionInfo();
+
+                    // Show errors if any
+                    if (result.errors && result.errors.length > 0) {
+                        setTimeout(() => {
+                            const errorList = result.errors.join('\n');
+                            showNotification('Some Emails Failed', errorList, 'warning');
+                        }, 2000);
+                    }
+                } else {
+                    showNotification('Error', result.message, 'error');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showNotification('Error', 'An error occurred while sending emails', 'error');
+            } finally {
+                hideLoader();
+                sendBtn.classList.remove('loading');
+                sendBtn.disabled = false;
+            }
+        });
+
+        // Load all parents when page loads
+        window.addEventListener('load', () => {
+            fetchAllParents();
+        });
+    </script>
+</body>
+
+</html>
+
+<?php
+$conn->close();
+?>

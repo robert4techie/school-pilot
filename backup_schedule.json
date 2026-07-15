@@ -1,0 +1,5 @@
+{
+    "auto_backup_enabled": true,
+    "retention_days": 60,
+    "last_backup_time": 1776359304
+}

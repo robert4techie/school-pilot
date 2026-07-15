@@ -1,0 +1,28 @@
+# Logs
+logs/
+*.log
+error_log
+
+# Uploaded files
+uploads/
+
+# Backups
+backups/
+
+# IDE
+.vscode/
+
+# Windows
+Thumbs.db
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+
+# Composer
+/vendor
+
+# Node
+/node_modules

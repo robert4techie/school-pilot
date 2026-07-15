@@ -1,0 +1,52 @@
+# ============================================================
+#  SchoolPilot – Root .htaccess
+#  Place this file in your project root directory
+# ============================================================
+
+# ── 1. DISABLE DIRECTORY LISTING ────────────────────────────
+Options -Indexes
+
+# ── 2. FOLLOW SYMBOLIC LINKS (required for rewrites) ────────
+Options +FollowSymLinks
+
+# ── 3. REWRITE ENGINE ───────────────────────────────────────
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Redirect bare directory access to index.php
+    # (catches http://example.com/somefolder/ with no index file)
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteCond %{REQUEST_FILENAME}/index.php !-f
+    RewriteRule ^(.*)$ /index.php [R=302,L]
+</IfModule>
+
+# ── 4. BLOCK DIRECT ACCESS TO SENSITIVE FILES ───────────────
+<FilesMatch "\.(sql|log|json|lock|md|env|htpasswd|htaccess|gitignore)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# Block access to composer files
+<FilesMatch "^(composer\.(json|lock)|\.env.*)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# ── 5. BLOCK ACCESS TO VENDOR & LOG DIRECTORIES ─────────────
+<IfModule mod_rewrite.c>
+    RewriteRule ^vendor/(.*)$ - [F,L]
+    RewriteRule ^logs/(.*)$   - [F,L]
+    RewriteRule ^backups/(.*)$ - [F,L]
+    RewriteRule ^sounds/(.*)$ - [F,L]
+</IfModule>
+
+# ── 6. SECURITY HEADERS ─────────────────────────────────────
+<IfModule mod_headers.c>
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-XSS-Protection "1; mode=block"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
+
+# ── 7. HIDE SERVER SIGNATURE ────────────────────────────────
+ServerSignature Off

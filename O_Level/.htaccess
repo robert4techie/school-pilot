@@ -1,0 +1,22 @@
+# ============================================================
+#  SchoolPilot – O_Level subfolder .htaccess
+#  Place this file inside your  O_Level/  directory
+# ============================================================
+
+# ── 1. DISABLE DIRECTORY LISTING ────────────────────────────
+Options -Indexes
+
+# ── 2. BLOCK DIRECT ACCESS TO THE ERROR LOG ─────────────────
+<FilesMatch "^error_log$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# ── 3. PROTECT ANALYTICS ENDPOINTS (internal use only) ──────
+<FilesMatch "^(analytics_api|analytics_export)\.php$">
+    <IfModule mod_rewrite.c>
+        RewriteEngine On
+        RewriteCond %{HTTP_X_REQUESTED_WITH} !^XMLHttpRequest$ [NC]
+        RewriteRule ^ - [F,L]
+    </IfModule>
+</FilesMatch>

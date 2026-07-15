@@ -1,0 +1,43 @@
+# ============================================================
+#  SchoolPilot – A_Level subfolder .htaccess
+#  Place this file inside your  A_Level/  directory
+# ============================================================
+
+# ── 1. DISABLE DIRECTORY LISTING ────────────────────────────
+Options -Indexes
+
+# ── 2. BLOCK DIRECT ACCESS TO THE ERROR LOG ─────────────────
+<FilesMatch "^error_log$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# ── 3. AJAX ENDPOINTS – POST ONLY ───────────────────────────
+#  REMOVED: X-Requested-With check — the native fetch() API does NOT send
+#  that header automatically, which caused every save/delete AJAX call to
+#  return 403 Forbidden.
+#  FIX: Block only direct GET requests (browser address-bar visits).
+#  auth.php now detects AJAX calls by script name and returns JSON on any
+#  auth failure, so no HTML is ever returned to the JS caller.
+<FilesMatch "^(delete_mark_ajax|save_mark_ajax)\.php$">
+    <IfModule mod_rewrite.c>
+        RewriteEngine On
+        RewriteCond %{REQUEST_METHOD} ^GET$ [NC]
+        RewriteRule ^ - [F,L]
+    </IfModule>
+</FilesMatch>
+
+# ── 4. BLOCK ACCESS TO SENSITIVE FILE TYPES ─────────────────
+<FilesMatch "\.(sql|log|bak|env|ini|sh|conf)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# ── 5. PREVENT PHP EXECUTION INSIDE UPLOADS FOLDER ──────────
+<FilesMatch "\.(php|php3|php4|php5|phtml)$">
+    <IfModule mod_rewrite.c>
+        RewriteEngine On
+        RewriteCond %{REQUEST_URI} /uploads/ [NC]
+        RewriteRule ^ - [F,L]
+    </IfModule>
+</FilesMatch>
